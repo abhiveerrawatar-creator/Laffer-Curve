@@ -1,0 +1,270 @@
+# =============================================================================
+# LAFFER CURVE ANALYSIS — DIAMOND-SAEZ OPTIMAL TOP TAX RATE FORMULA
+# Built from HMRC "Collated Income Tax liabilities statistics tables 2.1-2.6"
+# (your uploaded file, tax year 2023 to 2024 — the latest outturn/non-
+# projected year in the release)
+# -----------------------------------------------------------------------------
+# Paste each "# %%" block into its own Colab cell.
+# =============================================================================
+
+# %%
+# ---- CELL 1: Setup -------------------------------------------------------
+!pip install ipywidgets --quiet
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import ipywidgets as widgets
+from IPython.display import display
+
+plt.rcParams["figure.figsize"] = (9, 6)
+plt.rcParams["axes.grid"] = True
+plt.rcParams["grid.alpha"] = 0.3
+
+# %%
+# ---- CELL 2: Real HMRC data (2023 to 2024) -------------------------------
+# Source: your uploaded file.
+#   Table 2.1 ("Number of individual Income Tax payers by marginal rate, sex
+#   and age") -> total number of Income Tax payers.
+#   Table 2.4 ("Shares of total income ... for percentile groups") -> the
+#   income breakpoint (threshold) and the % share of total pre-tax income
+#   held by each top percentile group, plus total income for all taxpayers.
+#
+# Everything below is read straight off those two tables for 2023 to 2024 —
+# no unit-conversion guesswork required, because we derive n_above and
+# income_above ourselves from percentages and totals rather than assuming
+# a hidden thousands/millions convention.
+
+TAX_YEAR = "2023 to 2024"
+
+N_TAXPAYERS = 36_700_000          # Table 2.1: "All Income Tax payers" (36,700 thousand)
+TOTAL_INCOME = 1_530e9            # Table 2.4: total income before tax, all taxpayers (£1,530bn)
+
+# Table 2.4 breakpoints and income shares for each top percentile group
+hmrc_bands = pd.DataFrame([
+    {"band": "Top 25%", "p": 0.25, "share_pct": 53.3, "threshold_gbp": 45_000},
+    {"band": "Top 10%", "p": 0.10, "share_pct": 34.0, "threshold_gbp": 67_400},
+    {"band": "Top 5%",  "p": 0.05, "share_pct": 24.6, "threshold_gbp": 93_600},
+    {"band": "Top 1%",  "p": 0.01, "share_pct": 12.4, "threshold_gbp": 207_000},
+])
+
+hmrc_bands["n_above"] = hmrc_bands["p"] * N_TAXPAYERS
+hmrc_bands["income_above"] = (hmrc_bands["share_pct"] / 100) * TOTAL_INCOME
+hmrc_bands["mean_above"] = hmrc_bands["income_above"] / hmrc_bands["n_above"]
+
+print(f"Tax year: {TAX_YEAR}")
+print(hmrc_bands.to_string(index=False))
+
+# %%
+# ---- CELL 3: Estimate the Pareto parameter (a) ---------------------------
+# Diamond-Saez treat the top of the income distribution as Pareto. The
+# (inverse) Pareto parameter is:
+#
+#     a = mean_above / (mean_above - threshold)
+#
+# Two ways to estimate it from the four bands above:
+#   (1) Direct — using a single band's threshold and mean income above it.
+#   (2) Regression — log(n_above) vs log(threshold); the Pareto tail implies
+#       a straight line with slope -a. This is more robust since it uses
+#       all four points rather than just one.
+
+def alpha_direct(row):
+    return row["mean_above"] / (row["mean_above"] - row["threshold_gbp"])
+
+hmrc_bands["a_direct"] = hmrc_bands.apply(alpha_direct, axis=1)
+print(hmrc_bands[["band", "threshold_gbp", "mean_above", "a_direct"]].to_string(index=False))
+
+slope, intercept = np.polyfit(
+    np.log(hmrc_bands["threshold_gbp"]), np.log(hmrc_bands["n_above"]), 1
+)
+a_regression = -slope
+
+print(f"\nPareto parameter, direct method (Top 1% band):  {hmrc_bands.loc[hmrc_bands.band=='Top 1%', 'a_direct'].iloc[0]:.3f}")
+print(f"Pareto parameter, regression across all 4 bands: {a_regression:.3f}")
+
+# The direct estimate at Top 1% is the standard choice for top-rate analysis
+# (it's the band actually affected by a top-rate change); the regression
+# value is a useful robustness check since it isn't sensitive to noise in
+# any single band. Note the direct estimates fall as you move further into
+# the tail (2.03 -> 1.91 -> 1.84 -> 1.67) — a sign the distribution isn't
+# perfectly Pareto-shaped, which is normal and worth mentioning if you use
+# this in the essay.
+a_param = hmrc_bands.loc[hmrc_bands.band == "Top 1%", "a_direct"].iloc[0]
+print(f"\nUsing a = {a_param:.3f} (Top 1% direct estimate) for the analysis below.")
+
+# %%
+# ---- CELL 3B: Estimate the elasticity (ETI) from your own HMRC data -------
+# Rather than borrowing HMRC's 2012 figure, this uses the natural experiment
+# sitting in your file: the additional rate fell from 50p to 45p in April
+# 2013. Top 1% is the "treatment" group (their rate changed); the next
+# band down, the top 5% minus the top 1% (roughly P95-P99), is the
+# "control" group — they stayed on the unchanged 40% higher rate
+# throughout, so any difference in how the two groups' income grew is
+# attributable to the rate change, not the economy generally.
+#
+#     ETI = [Δlog(mean income, top 1%) − Δlog(mean income, control)]
+#           ─────────────────────────────────────────────────────────
+#                         Δlog(1 − τ)
+#
+# 2012-13 is excluded because HMRC's own report and later IFS work
+# (Browne and Phillips, 2017) flag it as distorted by "forestalling" —
+# people shifting income out of the 50p year and into the 45p year ahead
+# of the announced change.
+
+reform_panel = pd.DataFrame([
+    {"year": "2010-11", "N": 31_300, "total_income": 857, "share_top1": 11.5, "share_top5": 24.0},
+    {"year": "2011-12", "N": 30_800, "total_income": 886, "share_top1": 11.5, "share_top5": 24.2},
+    # 2012-13 deliberately skipped — forestalling year
+    {"year": "2013-14", "N": 30_400, "total_income": 951, "share_top1": 12.6, "share_top5": 25.1},
+    {"year": "2014-15", "N": 30_700, "total_income": 977, "share_top1": 12.3, "share_top5": 24.8},
+])
+reform_panel["mean_top1"] = (reform_panel["share_top1"] / 100 * reform_panel["total_income"] * 1e9) \
+                              / (0.01 * reform_panel["N"] * 1000)
+reform_panel["mean_control"] = ((reform_panel["share_top5"] - reform_panel["share_top1"]) / 100
+                                  * reform_panel["total_income"] * 1e9) / (0.04 * reform_panel["N"] * 1000)
+print(reform_panel[["year", "mean_top1", "mean_control"]].to_string(index=False))
+
+pre = reform_panel["year"].isin(["2010-11", "2011-12"])
+post = reform_panel["year"].isin(["2013-14", "2014-15"])
+
+dlog_top1 = np.log(reform_panel.loc[post, "mean_top1"].mean()) - np.log(reform_panel.loc[pre, "mean_top1"].mean())
+dlog_control = np.log(reform_panel.loc[post, "mean_control"].mean()) - np.log(reform_panel.loc[pre, "mean_control"].mean())
+dlog_netoftax = np.log(0.55) - np.log(0.50)   # (1-0.45) vs (1-0.50)
+
+eti_naive = (dlog_top1 - dlog_control) / dlog_netoftax
+print(f"\nNaive diff-in-diff ETI estimate: {eti_naive:.2f}")
+
+# PLACEBO CHECK: run the identical calculation over a period with no
+# additional-rate change at all (the additional rate didn't exist before
+# 2010), to see how much of that "excess growth" is really just top
+# incomes trending ahead of the group just below them, tax rates aside.
+placebo_panel = pd.DataFrame([
+    {"year": "2003-04", "N": 28_500, "total_income": 625, "share_top1": 11.0, "share_top5": 23.6},
+    {"year": "2006-07", "N": 31_800, "total_income": 810, "share_top1": 12.9, "share_top5": 25.8},
+])
+placebo_panel["mean_top1"] = (placebo_panel["share_top1"] / 100 * placebo_panel["total_income"] * 1e9) \
+                               / (0.01 * placebo_panel["N"] * 1000)
+placebo_panel["mean_control"] = ((placebo_panel["share_top5"] - placebo_panel["share_top1"]) / 100
+                                   * placebo_panel["total_income"] * 1e9) / (0.04 * placebo_panel["N"] * 1000)
+
+dlog_top1_placebo = np.log(placebo_panel["mean_top1"].iloc[1]) - np.log(placebo_panel["mean_top1"].iloc[0])
+dlog_control_placebo = np.log(placebo_panel["mean_control"].iloc[1]) - np.log(placebo_panel["mean_control"].iloc[0])
+excess_growth_placebo = dlog_top1_placebo - dlog_control_placebo
+
+print(f"Placebo excess growth (top 1% over control, 2003-04 to 2006-07, NO rate change): {excess_growth_placebo:.3f}")
+print(f"Excess growth actually observed around the 2013 reform:                          {dlog_top1 - dlog_control:.3f}")
+print("\nThese two numbers are similar in size. That means most of the 'excess growth' in")
+print("the naive ETI calculation above is likely just top incomes trending ahead of the")
+print("group just below them for reasons unrelated to the 2013 rate cut (globalisation of")
+print("pay-setting, executive compensation trends, etc.) — not a genuine behavioural")
+print("response to the tax change. A naive two-group diff-in-diff like this one cannot")
+print("separate the two, which is exactly why HMRC's and IFS's actual papers use")
+print("individual-level panel microdata and formal trend controls rather than this")
+print("simpler approach. Treat eti_naive above as an upper bound, not a point estimate —")
+print("worth stating explicitly if you use this exercise in the essay.")
+
+# %%
+# ---- CELL 4: Diamond-Saez optimal top rate formula ------------------------
+# Revenue-maximising top marginal rate:
+#
+#     tau* = 1 / (1 + a * e)
+#
+# where e is the elasticity of taxable income (ETI) with respect to
+# (1 - tau). HMRC's own report (2012, "The Exchequer effect of the 50 per
+# cent additional rate of income tax") estimated a central TIE of 0.48 from
+# the 2010 introduction of the 50p rate, close to Brewer, Saez and
+# Shephard's (2008) Mirrlees Review estimate of 0.46 using earlier UK rate
+# changes. Both figures are contested: Saez, Slemrod and Giertz's (2012)
+# independent survey of the wider evidence puts the credible range at
+# 0.12-0.40, well below HMRC's own number, and IFS's 2017 re-analysis
+# (Browne and Phillips) found estimates ranging from 0.31 to 0.83 depending
+# on which post-reform year's data is used. Cell 3B's own DIY diff-in-diff
+# estimate, run directly on your uploaded data, came out even higher still
+# (and its placebo check suggests why: a naive two-group comparison picks
+# up pre-existing income trends, not just the tax response). Given all of
+# this, 0.48 is used below as HMRC's own headline figure — not because it's
+# settled, but because it's the most-cited number in this specific debate —
+# with Cell 7's sensitivity table covering the full contested range.
+
+def optimal_top_rate(a, e):
+    return 1 / (1 + a * e)
+
+e_central = 0.48   # HMRC (2012) central estimate
+tau_star = optimal_top_rate(a_param, e_central)
+print(f"Revenue-maximising top rate at a={a_param:.2f}, e={e_central}: {tau_star:.1%}")
+
+# %%
+# ---- CELL 5: Build the Laffer curve ---------------------------------------
+# Taxable income responds to the net-of-tax rate:
+#
+#     z(tau) = z(tau_0) * [(1 - tau) / (1 - tau_0)]^e
+#
+# Revenue from the top bracket (index form — the shape of R(tau) and where
+# it peaks is all that matters here, not pound-for-pound levels):
+#
+#     R(tau) ∝ tau * (1 - tau)^(a * e)     maximised at tau* = 1/(1 + a*e)
+
+def laffer_revenue_index(tau, a, e):
+    tau = np.asarray(tau)
+    return tau * (1 - tau) ** (a * e)
+
+tau_grid = np.linspace(0.01, 0.95, 400)
+
+def plot_laffer(a=a_param, e=e_central, current_rate=0.45):
+    revenue = laffer_revenue_index(tau_grid, a, e)
+    revenue_norm = revenue / revenue.max()
+
+    tau_opt = optimal_top_rate(a, e)
+    rev_at_current = laffer_revenue_index(current_rate, a, e) / revenue.max()
+
+    fig, ax = plt.subplots()
+    ax.plot(tau_grid * 100, revenue_norm, lw=2.5, color="#2b6cb0",
+            label="Laffer curve (indexed revenue)")
+    ax.axvline(tau_opt * 100, color="#c53030", ls="--", lw=1.5,
+               label=f"Optimal rate τ* = {tau_opt:.1%}")
+    ax.axvline(current_rate * 100, color="#2f855a", ls=":", lw=1.5,
+               label=f"Current top rate = {current_rate:.0%}")
+    ax.scatter([tau_opt * 100], [1.0], color="#c53030", zorder=5)
+    ax.scatter([current_rate * 100], [rev_at_current], color="#2f855a", zorder=5)
+
+    ax.set_xlabel("Top marginal tax rate, τ (%)")
+    ax.set_ylabel("Revenue (indexed to peak = 1.0)")
+    ax.set_title(f"Diamond-Saez Laffer Curve — HMRC {TAX_YEAR}  (a = {a:.2f}, e = {e:.2f})")
+    ax.legend(loc="lower center")
+    ax.set_ylim(0, 1.05)
+    plt.show()
+
+    print(f"Pareto parameter a:      {a:.2f}")
+    print(f"Elasticity e:            {e:.2f}")
+    print(f"Revenue-maximising rate: {tau_opt:.1%}")
+    print(f"Current rate:            {current_rate:.0%}")
+    if current_rate < tau_opt:
+        print("→ Current rate is BELOW the revenue-maximising rate: "
+              "further rises would raise revenue.")
+    else:
+        print("→ Current rate is ABOVE the revenue-maximising rate: "
+              "further rises would lose revenue.")
+
+plot_laffer()
+
+# %%
+# ---- CELL 6: Interactive sliders -------------------------------------------
+widgets.interact(
+    plot_laffer,
+    a=widgets.FloatSlider(value=a_param, min=1.0, max=4.0, step=0.05,
+                           description="Pareto a"),
+    e=widgets.FloatSlider(value=e_central, min=0.05, max=0.8, step=0.01,
+                           description="Elasticity e"),
+    current_rate=widgets.FloatSlider(value=0.45, min=0.20, max=0.70, step=0.01,
+                                      description="Current τ"),
+)
+
+# %%
+# ---- CELL 7: Sensitivity table across the literature's elasticity range ---
+e_values = [0.12, 0.20, 0.31, 0.40, 0.48, 0.60, 0.83]
+sensitivity = pd.DataFrame({
+    "elasticity_e": e_values,
+    "optimal_top_rate": [f"{optimal_top_rate(a_param, e):.1%}" for e in e_values],
+})
+print(f"Sensitivity of τ* to elasticity (a = {a_param:.2f}, from HMRC {TAX_YEAR} Top 1% band):\n")
+print(sensitivity.to_string(index=False))
